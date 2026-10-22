@@ -1,0 +1,63 @@
+[paths]
+# Cohort CSV containing subject IDs and model variables.
+source = /absolute/path/to/cohort.csv
+
+# Integer-labelled atlas used for ROI extraction.
+atlas = /absolute/path/to/atlas_labels.nii.gz
+
+# Binary mask used for voxelwise analysis.
+mask = /absolute/path/to/voxelwise_mask.nii.gz
+
+# Output directory for this analysis.
+output = outputs/analysis_name
+
+
+[imaging]
+# Column in the cohort CSV containing unique subject IDs.
+subject_id_column = subject_id
+
+# One 3D scalar image per subject. {subject} is replaced with the subject ID.
+image_pattern = /absolute/path/to/images/{subject}/scalar_map.nii.gz
+
+
+[analysis]
+# roi | voxelwise | roi, voxelwise
+analysis = roi, voxelwise
+
+
+[model]
+# Predictor whose effect is being tested.
+# Use "intercept" for an intercept-only one-sample/group-mean analysis.
+primary_predictor = PRIMARY_PREDICTOR_COLUMN
+
+# Optional adjustment variables, comma-separated.
+covariates =
+
+
+[references]
+# Explicit reference levels for categorical model variables,
+# including numeric-coded categories such as 0/1. Omit continuous variables.
+# sex = female
+# diagnosis = control
+
+
+[roi_statistics]
+# Raw p-value threshold for ROI reporting.
+p_threshold = 0.05
+
+# none | fdr_bh
+multiple_comparisons = fdr_bh
+
+# FDR q-value threshold.
+q_threshold = 0.05
+
+
+[voxelwise_statistics]
+# Raw p-value threshold for voxelwise maps.
+p_threshold = 0.001
+
+# none | fdr_bh
+multiple_comparisons = fdr_bh
+
+# FDR q-value threshold.
+q_threshold = 0.05
