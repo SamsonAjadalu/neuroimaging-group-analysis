@@ -2,7 +2,7 @@ import unittest
 
 import pandas as pd
 
-from group_stats import parse_analyses
+from group_stats import _complete_cases, parse_analyses
 from roi_stats import discover_roi_features
 
 
@@ -17,6 +17,20 @@ class AnalysisConfigTests(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
                     parse_analyses(value)
+
+    def test_complete_case_filter_checks_only_selected_variables(self):
+        data = pd.DataFrame({
+            "subject_id": ["s1", "s2", "s3"],
+            "Group": [0, 1, 1],
+            "Age": [70.0, 72.0, 69.0],
+            "APOE4": [0.0, None, 1.0],
+        })
+        no_apoe, no_apoe_excluded = _complete_cases(data, ["Group", "Age"], "subject_id")
+        apoe, apoe_excluded = _complete_cases(data, ["Group", "Age", "APOE4"], "subject_id")
+        self.assertEqual(no_apoe["subject_id"].tolist(), ["s1", "s2", "s3"])
+        self.assertEqual(no_apoe_excluded, [])
+        self.assertEqual(apoe["subject_id"].tolist(), ["s1", "s3"])
+        self.assertEqual(apoe_excluded, ["s2"])
 
 
 class RoiDiscoveryTests(unittest.TestCase):

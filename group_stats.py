@@ -153,6 +153,19 @@ def _validate_model_values(
             raise ValueError(f"Missing {column} values; no subjects were dropped or imputed: {ids}")
 
 
+def _complete_cases(data: pd.DataFrame, variables: list[str], subject_column: str) -> tuple[pd.DataFrame, list[str]]:
+    """Select rows complete for variables used by this configured model."""
+    if not variables:
+        return data.copy(), []
+    missing = data[variables].isna()
+    for column in variables:
+        if pd.api.types.is_object_dtype(data[column]) or pd.api.types.is_string_dtype(data[column]):
+            missing[column] |= data[column].astype(str).str.strip().eq("")
+    keep = ~missing.any(axis=1)
+    excluded_ids = data.loc[~keep, subject_column].astype(str).tolist()
+    return data.loc[keep].copy().reset_index(drop=True), excluded_ids
+
+
 def _remove_unrequested_outputs(output_dir: Path, requested: list[str]) -> None:
     """Remove only recognized DWI result files for branches disabled in this run."""
     if "roi" not in requested:
@@ -206,6 +219,9 @@ def run_analysis(config: dict, prepared_data_path: Path) -> dict:
 
     primary_predictor = model.get("primary_predictor", "").strip()
     covariates = _items(model.get("covariates", ""))
+    missing_policy = model.get("missing", "error").strip().lower()
+    if missing_policy not in {"error", "drop"}:
+        raise ValueError("[model] missing must be 'error' or 'drop'")
     if not primary_predictor:
         raise ValueError("Config [model] must specify primary_predictor")
     intercept_mode = primary_predictor.lower() == "intercept"
@@ -235,7 +251,25 @@ def run_analysis(config: dict, prepared_data_path: Path) -> dict:
 
     data = pd.read_csv(data_path, dtype={subject_column: "string"})
     _validate_subject_order(data, source_path, subject_column)
+    source_n = len(data)
+    excluded_ids = []
+    missing_columns = sorted(set(variable_names) - set(data.columns))
+    if missing_columns:
+        raise ValueError(f"Prepared data are missing required model columns: {missing_columns}")
+    if missing_policy == "drop":
+        data, excluded_ids = _complete_cases(data, variable_names, subject_column)
+        if data.empty:
+            raise ValueError("Complete-case filtering left no subjects for this model")
     _validate_model_values(data, variable_names, subject_column)
+    if missing_policy == "drop":
+        output_dir.mkdir(parents=True, exist_ok=True)
+        log_path = output_dir / "cohort_filter.log"
+        log_path.write_text(
+            f"Source N: {source_n}\nIncluded N: {len(data)}\nExcluded N: {len(excluded_ids)}\n"
+            f"Model variables checked: {', '.join(variable_names) if variable_names else '(intercept only)'}\n"
+            f"Excluded subject IDs: {', '.join(excluded_ids) if excluded_ids else 'none'}\n",
+            encoding="utf-8",
+        )
     terms = _model_terms(variable_names, references, data, subject_column)
 
     roi_features = roi_stats.discover_roi_features(data) if "roi" in modules else []
