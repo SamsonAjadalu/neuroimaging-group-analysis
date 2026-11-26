@@ -32,6 +32,11 @@ example after changing the input cohort, images, or atlas:
 .venv/bin/python run_analysis.py my_analysis.txt --prepare
 ```
 
+The terminal shows timestamped milestones and live progress for operations with
+known counts. Bulk operations such as voxelwise loading and fitting report
+start and elapsed time. Progress goes to stderr, so use `> run.log 2>&1` to
+capture it; redirected logs receive occasional line-based updates.
+
 ## Input and preparation
 
 The source CSV has one row per subject, a unique subject ID, and the variables

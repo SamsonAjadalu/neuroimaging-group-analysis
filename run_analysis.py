@@ -7,6 +7,7 @@ from pathlib import Path
 
 from group_stats import model_predictors, parse_analyses, run_analysis
 from prepare_data import prepare_data
+from progress import message, timed
 
 
 def load_config(config_path: Path) -> dict:
@@ -92,13 +93,20 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        config = load_config(args.config)
+        with timed(f"[1] Loading configuration: {args.config}"):
+            config = load_config(args.config)
         prepared_data = Path(config["paths"]["output"]) / "prepared_data.csv"
-        if args.prepare or not prepared_data.is_file():
-            prepare_data(config, prepared_data)
+        needs_prepare = args.prepare or not prepared_data.is_file()
+        modules = parse_analyses(config["analysis"]["analysis"])
+        steps = (["resolve", "extract"] if needs_prepare else []) + ["design"]
+        steps.extend(module for module in ("roi", "voxelwise") if module in modules)
+        stages = {key: f"[{i}/{len(steps) + 1}] " for i, key in enumerate(steps, 2)}
+        if needs_prepare:
+            prepare_data(config, prepared_data, stages=stages)
         else:
-            print(f"Using prepared data: {prepared_data}")
-        run_analysis(config, prepared_data)
+            message(f"Using prepared data: {prepared_data}")
+        with timed("Analysis"):
+            run_analysis(config, prepared_data, stages=stages)
     except Exception as error:
         parser.exit(1, f"ERROR: {error}\n")
     return 0

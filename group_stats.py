@@ -10,6 +10,7 @@ import patsy
 
 import roi_stats
 import voxelwise_stats
+from progress import message, timed
 
 
 IDENTIFIER = re.compile(r"^[A-Za-z_]\w*$")
@@ -206,13 +207,14 @@ def _remove_unrequested_outputs(output_dir: Path, requested: list[str]) -> None:
                     path.unlink()
 
 
-def run_analysis(config: dict, prepared_data_path: Path) -> dict:
+def run_analysis(config: dict, prepared_data_path: Path, *, stages=None) -> dict:
     """Validate cohort/model once, then pass the same design to requested analyses."""
     paths = config["paths"]
     analysis = config["analysis"]
     imaging = config["imaging"]
     model = config["model"]
     references = config.get("references", {})
+    stages = stages or {}
 
     modules = parse_analyses(analysis.get("analysis", ""))
     if "rois" in analysis:
@@ -260,15 +262,19 @@ def run_analysis(config: dict, prepared_data_path: Path) -> dict:
     roi_settings = _analysis_settings(config, "roi_statistics") if "roi" in modules else None
     voxel_settings = _analysis_settings(config, "voxelwise_statistics") if "voxelwise" in modules else None
 
-    data = pd.read_csv(data_path, dtype={subject_column: "string"})
-    _validate_subject_order(data, source_path, subject_column)
+    message(f"{stages.get('design', '')}Validating cohort and design")
+    with timed("Loading model data and checking subject order"):
+        data = pd.read_csv(data_path, dtype={subject_column: "string"})
+        _validate_subject_order(data, source_path, subject_column)
     source_n = len(data)
     excluded_ids = []
     missing_columns = sorted(set(variable_names) - set(data.columns))
     if missing_columns:
         raise ValueError(f"Prepared data are missing required model columns: {missing_columns}")
     if missing_policy == "drop":
-        data, excluded_ids = _complete_cases(data, variable_names, subject_column)
+        with timed(f"Complete-case filtering: {source_n} subjects"):
+            data, excluded_ids = _complete_cases(data, variable_names, subject_column)
+        message(f"Complete cases: {len(data)}/{source_n} subjects; excluded {len(excluded_ids)}")
         if data.empty:
             raise ValueError("Complete-case filtering left no subjects for this model")
     _validate_model_values(data, variable_names, subject_column)
@@ -299,7 +305,8 @@ def run_analysis(config: dict, prepared_data_path: Path) -> dict:
         )
 
     rhs = "1" if intercept_mode else " + ".join(terms.values())
-    design = patsy.dmatrix(rhs, data, return_type="dataframe", NA_action="raise")
+    with timed(f"Constructing design matrix: {len(data)} subjects"):
+        design = patsy.dmatrix(rhs, data, return_type="dataframe", NA_action="raise")
     primary_indices = {}
     for predictor in primary:
         term = "Intercept" if intercept_mode else terms[predictor]
@@ -319,6 +326,7 @@ def run_analysis(config: dict, prepared_data_path: Path) -> dict:
     residual_df = len(data) - rank
     if residual_df <= 0:
         raise ValueError(f"Model has no residual degrees of freedom: N={len(data)}, rank={rank}")
+    message(f"Design validated: {len(data)} subjects, {design.shape[1]} columns, rank {rank}, residual df {residual_df}")
 
     # All model and branch-specific validation completes before output creation.
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -327,6 +335,7 @@ def run_analysis(config: dict, prepared_data_path: Path) -> dict:
 
     roi_summary = None
     if "roi" in modules:
+        message(f"{stages.get('roi', '')}Running ROI analysis: {len(data)} subjects, {len(roi_features)} ROIs")
         roi_summary = roi_stats.run_roi_analysis(
             data=data,
             design_values=design_values,
@@ -343,6 +352,7 @@ def run_analysis(config: dict, prepared_data_path: Path) -> dict:
 
     voxel_summary = None
     if "voxelwise" in modules:
+        message(f"{stages.get('voxelwise', '')}Running voxelwise analysis: {len(data)} subjects")
         voxel_summary = voxelwise_stats.run_voxelwise_analysis(
             data=data,
             image_paths=image_paths,
@@ -357,7 +367,8 @@ def run_analysis(config: dict, prepared_data_path: Path) -> dict:
             output_dir=output_dir / "voxelwise",
         )
 
-    design_output.to_csv(output_dir / "design_matrix.csv", index=False)
+    with timed("Saving design matrix"):
+        design_output.to_csv(output_dir / "design_matrix.csv", index=False)
     references_text = ", ".join(f"{name}={value}" for name, value in references.items()) or "none"
     summary = [
         f"N: {len(data)}",
@@ -392,11 +403,12 @@ def run_analysis(config: dict, prepared_data_path: Path) -> dict:
             for number, (column, coefficient) in enumerate(result["level_results"].items(), 1):
                 summary.append(f"Coefficient {number:02d}: {column}")
                 summary.extend(voxelwise_stats.summary_lines(coefficient))
-    (output_dir / "analysis_summary.txt").write_text("\n".join(summary) + "\n", encoding="utf-8")
+    with timed(f"Saving analysis summary: {output_dir}"):
+        (output_dir / "analysis_summary.txt").write_text("\n".join(summary) + "\n", encoding="utf-8")
 
     if not plural:
         _remove_unrequested_outputs(output_dir, modules)
-    print(
+    message(
         f"Completed {', '.join(modules)} analysis for N={len(data)}; "
         f"design rank {rank}/{design.shape[1]}, residual df={residual_df}."
     )

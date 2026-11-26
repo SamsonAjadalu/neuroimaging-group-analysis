@@ -8,6 +8,8 @@ import nibabel as nib
 import numpy as np
 import pandas as pd
 
+from progress import message, progress, timed
+
 
 def resolve_image(pattern: str, subject_id: str) -> Path:
     """Resolve exactly one regular image file for a subject from the configured template."""
@@ -26,7 +28,7 @@ def resolve_image(pattern: str, subject_id: str) -> Path:
     return Path(matches[0])
 
 
-def prepare_data(config: dict, prepared_data_path: Path | None = None) -> pd.DataFrame:
+def prepare_data(config: dict, prepared_data_path: Path | None = None, *, stages=None) -> pd.DataFrame:
     """Validate configured images and append means for every atlas label."""
     paths = config["paths"]
     imaging = config["imaging"]
@@ -35,6 +37,7 @@ def prepare_data(config: dict, prepared_data_path: Path | None = None) -> pd.Dat
     output_path = Path(prepared_data_path or (Path(paths["output"]) / "prepared_data.csv"))
     subject_column = imaging["subject_id_column"]
     image_pattern = imaging["image_pattern"]
+    stages = stages or {}
     if not source.is_file():
         raise FileNotFoundError(f"Source cohort CSV not found: {source}")
     if not atlas_path.is_file():
@@ -63,7 +66,9 @@ def prepare_data(config: dict, prepared_data_path: Path | None = None) -> pd.Dat
 
     resolved_images = []
     resolution_errors = []
-    for subject_id in subject_ids.astype(str):
+    resolve_label = f"{stages.get('resolve', '')}Resolving subject images"
+    message(f"{resolve_label}: {len(subject_ids)} subjects")
+    for subject_id in progress(subject_ids.astype(str), label=resolve_label, unit="subject"):
         try:
             resolved_images.append(resolve_image(image_pattern, subject_id))
         except (FileNotFoundError, ValueError) as error:
@@ -97,7 +102,12 @@ def prepare_data(config: dict, prepared_data_path: Path | None = None) -> pd.Dat
 
     atlas_zooms = np.asarray(atlas_image.header.get_zooms()[:3], dtype=float)
     roi_rows = []
-    for subject_id, image_path in zip(subject_ids.astype(str), resolved_images):
+    extract_label = f"{stages.get('extract', '')}Validating images and extracting ROI means"
+    message(f"{extract_label}: {len(subject_ids)} subjects, {len(labels)} ROIs")
+    for subject_id, image_path in progress(
+        zip(subject_ids.astype(str), resolved_images),
+        total=len(subject_ids), label=extract_label, unit="subject",
+    ):
         image = nib.load(str(image_path))
         if len(image.shape) != 3:
             raise ValueError(f"{subject_id}: image is not 3D; shape={image.shape}")
@@ -130,8 +140,9 @@ def prepare_data(config: dict, prepared_data_path: Path | None = None) -> pd.Dat
         raise RuntimeError("Prepared subject IDs/order differ from the source CSV")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    prepared.to_csv(output_path, index=False)
-    print(
+    with timed(f"Saving prepared data: {output_path}"):
+        prepared.to_csv(output_path, index=False)
+    message(
         f"Prepared {len(prepared)} subjects; extracted {len(labels)} ROI means "
         f"for labels {labels}: {output_path}"
     )

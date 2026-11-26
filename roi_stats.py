@@ -10,6 +10,8 @@ import pandas as pd
 import statsmodels.api as sm
 from statsmodels.stats.multitest import multipletests
 
+from progress import message, progress
+
 
 ROI_COLUMN = re.compile(r"^ROI_([0-9]+)$")
 LEVEL_SUFFIX = re.compile(r"\[T\.(.*)\]$")
@@ -71,7 +73,8 @@ def run_roi_analysis(
     rows = {name: [] for name in primary_indices}
     levels = {name: [] for name in primary_indices}
     identity = np.eye(design_values.shape[1])
-    for roi_id, outcome in roi_features:
+    message(f"Fitting ROI regressions and evaluating contrasts: {len(roi_features)} ROIs")
+    for roi_id, outcome in progress(roi_features, label="ROI fits and contrasts", unit="ROI"):
         values = data[outcome].to_numpy(dtype=float)
         fit = sm.OLS(values, design_values).fit()
         estimates, errors, statistics, p_values = fit.params, fit.bse, fit.tvalues, fit.pvalues
@@ -118,7 +121,9 @@ def run_roi_analysis(
                     rows[name].append({"ROI_ID": roi_id, f"beta_{name}": beta, **common})
 
     summaries = {}
-    for name in primary_indices:
+    correction_label = "Applying ROI BH-FDR and saving results" if correction == "fdr_bh" else "Saving ROI results"
+    message(f"{correction_label}: {len(primary_indices)} predictors")
+    for name in progress(primary_indices, label=correction_label, unit="predictor"):
         destination = output_dir / name if predictor_subdirs else output_dir
         destination.mkdir(parents=True, exist_ok=True)
         result = pd.DataFrame(rows[name])

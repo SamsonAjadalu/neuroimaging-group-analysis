@@ -16,6 +16,8 @@ from scipy.stats import f as f_distribution
 from scipy.stats import t as t_distribution
 from statsmodels.stats.multitest import multipletests
 
+from progress import message, progress, timed
+
 
 OUTPUT_SUFFIX = (
     r"_(?:effect|se|ci_low|ci_high|t|p|q_fdr|uncorrected_p\d+_mask|"
@@ -81,7 +83,11 @@ def validate_inputs(
     if len(image_paths) != len(data):
         raise ValueError("Voxelwise image count/order does not match the validated cohort rows")
 
-    for subject_id, image_path in zip(data[subject_column].astype(str), image_paths):
+    message(f"Validating voxelwise input images: {len(image_paths)} subjects")
+    for subject_id, image_path in progress(
+        zip(data[subject_column].astype(str), image_paths),
+        label="Voxelwise input validation", unit="subject", total=len(image_paths),
+    ):
         image = nib.load(str(image_path))
         if len(image.shape) != 3:
             raise ValueError(f"{subject_id}: voxelwise image must be 3D; found {image.shape}")
@@ -168,9 +174,12 @@ def run_voxelwise_analysis(
     """Fit masked OLS once and evaluate all primary contrasts on that fit."""
     if len(image_paths) != len(data) or design.shape[0] != len(data):
         raise ValueError("Voxelwise image/design row counts do not match the validated cohort")
-    masker = NiftiMasker(mask_img=mask_image).fit()
-    labels, results = run_glm(masker.transform([str(path) for path in image_paths]),
-                              design.to_numpy(dtype=float), noise_model="ols", n_jobs=1)
+    with timed(f"Loading and masking voxelwise images: {len(image_paths)} subjects"):
+        masker = NiftiMasker(mask_img=mask_image).fit()
+        outcomes = masker.transform([str(path) for path in image_paths])
+    with timed(f"Fitting voxelwise OLS: {outcomes.shape[0]} subjects, {outcomes.shape[1]} voxels"):
+        labels, results = run_glm(outcomes, design.to_numpy(dtype=float), noise_model="ols", n_jobs=1)
+    del outcomes
     results = {label: SimpleRegressionResults(result) for label, result in results.items()}
     mask = mask_image.get_fdata(dtype=np.float32) > 0
     identity = np.eye(design.shape[1])
@@ -185,19 +194,30 @@ def run_voxelwise_analysis(
         )
 
     summaries = {}
-    for name, indices in primary_indices.items():
-        destination = output_dir / name if predictor_subdirs else output_dir
-        result = evaluate(name, indices, destination)
-        result["level_results"] = {}
-        if len(indices) > 1:
-            index_rows = []
-            for number, index in enumerate(indices, 1):
-                column = design.columns[index]
-                folder = f"coefficient_{number:02d}"
-                result["level_results"][column] = evaluate(name, [index], destination / folder)
-                index_rows.append({"directory": folder, "design_column": column})
-            pd.DataFrame(index_rows).to_csv(destination / "coefficient_index.csv", index=False)
-        summaries[name] = result
+    n_tests = sum(1 + (len(indices) if len(indices) > 1 else 0)
+                  for indices in primary_indices.values())
+    phase = "Evaluating voxelwise contrasts"
+    if correction == "fdr_bh":
+        phase += ", applying BH-FDR"
+    phase += " and saving maps"
+    with timed(f"{phase}: {n_tests} tests"), progress(
+        label="Voxelwise tests and maps", unit="test", total=n_tests,
+    ) as bar:
+        for name, indices in primary_indices.items():
+            destination = output_dir / name if predictor_subdirs else output_dir
+            result = evaluate(name, indices, destination)
+            bar.update()
+            result["level_results"] = {}
+            if len(indices) > 1:
+                index_rows = []
+                for number, index in enumerate(indices, 1):
+                    column = design.columns[index]
+                    folder = f"coefficient_{number:02d}"
+                    result["level_results"][column] = evaluate(name, [index], destination / folder)
+                    index_rows.append({"directory": folder, "design_column": column})
+                    bar.update()
+                pd.DataFrame(index_rows).to_csv(destination / "coefficient_index.csv", index=False)
+            summaries[name] = result
     return summaries
 
 
