@@ -5,7 +5,7 @@ import argparse
 import configparser
 from pathlib import Path
 
-from group_stats import parse_analyses, run_analysis
+from group_stats import model_predictors, parse_analyses, run_analysis
 from prepare_data import prepare_data
 
 
@@ -24,6 +24,7 @@ def load_config(config_path: Path) -> dict:
         raise ValueError(f"Config is missing sections: {sorted(missing_sections)}")
 
     config = {section: dict(parser.items(section)) for section in parser.sections()}
+    model_predictors(config["model"])
     modules = parse_analyses(config["analysis"].get("analysis", ""))
     paths = config["paths"]
     imaging = config["imaging"]

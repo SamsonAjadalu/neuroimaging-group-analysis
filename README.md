@@ -92,9 +92,34 @@ sex = female
 ```
 
 Continuous predictors use their numeric values. Categorical predictors use
-explicit reference levels. A one-column primary effect is reported as a
-coefficient test. A multi-level categorical primary effect receives a joint
-omnibus F test; ROI outputs also include level-specific estimates.
+explicit reference levels. To report several effects from one adjusted model,
+use `primary_predictors` instead of `primary_predictor`:
+
+```ini
+[model]
+primary_predictors = group, exposure, group_by_exposure
+covariates = age, sex
+
+[references]
+group = control
+exposure = no
+group_by_exposure = baseline
+sex = female
+```
+
+The source CSV supplies every model column. For a categorical group-by-binary
+interaction, set the interaction column to `baseline` for all unexposed subjects
+and all reference-group subjects, and to a distinct level for each other
+exposed group. Include both main effects as shown. With four groups this
+creates three difference-in-differences columns. The runner does not derive
+interaction columns from the config.
+
+Both branches fit one shared model: one fit per ROI or one masked voxelwise
+OLS pass. A one-column primary predictor gets a two-sided t-test. A predictor
+with multiple design columns gets a joint F-test plus a two-sided t-test for
+each column. Covariates are included in the fit but are not exported as tests.
+The default missing-value policy is `error`; `missing = drop` uses complete
+cases across all selected primary predictors and covariates.
 
 For an intercept-only, one-sample/group-mean test against zero:
 
@@ -113,9 +138,10 @@ precomputed subject-level change image through `image_pattern`.
 
 ROI and voxelwise settings are configured independently in
 `[roi_statistics]` and `[voxelwise_statistics]`. Each branch can report raw
-p-value thresholds and apply Benjamini-Hochberg FDR to its own test family.
-Coefficient tests are two-sided. ROI coefficient confidence intervals are
-95%.
+p-value thresholds and apply Benjamini–Hochberg FDR. Each omnibus test and each
+individual coefficient has its own family across ROIs or valid voxels. No
+correction is pooled across predictors, coefficients, or branches. Exported
+coefficient confidence intervals are pointwise 95% intervals.
 
 The configured output directory contains:
 
@@ -134,6 +160,19 @@ The summary records cohort size, model, design columns, rank, condition number,
 residual degrees of freedom, and branch-specific test counts. NIfTI maps retain
 the configured mask geometry; thresholded statistic maps show statistic values
 at voxels passing the corresponding threshold.
+
+The singular config keeps the existing output paths. The plural config places
+results in `roi/<predictor>/` and `voxelwise/<predictor>/`. For a multi-column
+predictor, `roi_results.csv` contains its omnibus test and
+`primary_level_results.csv` contains its coefficient tests, keyed by design
+column. The voxelwise omnibus F, p, and optional q maps are in the predictor
+directory (the voxelwise root for a singular config). Each
+`coefficient_01/`, `coefficient_02/`, etc. contains its effect, SE, t, p,
+confidence bounds, and configured threshold products. Read
+`coefficient_index.csv` to map those directories to the current design columns.
+Statistics and effect maps use zero outside the valid mask; p and q maps use
+one. Predictor directories not requested in a new run are left intact; use a
+new output directory when changing the model to keep results separate.
 
 ## Tests
 

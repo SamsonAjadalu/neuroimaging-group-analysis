@@ -26,12 +26,14 @@ analysis = roi, voxelwise
 
 
 [model]
-# Predictor whose effect is being tested.
+# Use one primary setting: primary_predictor or primary_predictors.
 # Use "intercept" for an intercept-only one-sample/group-mean analysis.
 primary_predictor = PRIMARY_PREDICTOR_COLUMN
+# primary_predictors = predictor_one, predictor_two
 
 # Optional adjustment variables, comma-separated.
 covariates =
+# missing = drop
 
 
 [references]

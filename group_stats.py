@@ -39,6 +39,30 @@ def _items(value: str) -> list[str]:
     return items
 
 
+def model_predictors(model: dict) -> tuple[list[str], list[str], bool]:
+    """Parse the primary terms and covariates shared by both analysis branches."""
+    keys = {"primary_predictor", "primary_predictors"} & model.keys()
+    if len(keys) != 1:
+        raise ValueError("[model] must specify exactly one of primary_predictor or primary_predictors")
+    plural = "primary_predictors" in keys
+    singular = model.get("primary_predictor", "").strip()
+    primary = _items(model["primary_predictors"]) if plural else ([singular] if singular else [])
+    if not primary:
+        raise ValueError("[model] must specify at least one primary predictor")
+    covariates = _items(model.get("covariates", ""))
+    names = primary + covariates
+    if len({name.lower() for name in names}) != len(names):
+        raise ValueError("Primary predictors and covariates must be unique and non-overlapping")
+    invalid = [name for name in names if not IDENTIFIER.fullmatch(name)]
+    if invalid:
+        raise ValueError(f"Model variable names must be simple Python identifiers: {invalid}")
+    if any(name.lower() == "intercept" for name in names):
+        if len(primary) != 1 or primary[0].lower() != "intercept" or covariates:
+            raise ValueError("Intercept mode requires intercept as the sole primary predictor and no covariates")
+        primary = ["intercept"]
+    return primary, covariates, plural
+
+
 def _threshold(settings: dict, key: str) -> float | None:
     raw = settings.get(key, "").strip()
     if not raw:
@@ -217,32 +241,19 @@ def run_analysis(config: dict, prepared_data_path: Path) -> dict:
     if not subject_column:
         raise ValueError("[imaging] must specify subject_id_column")
 
-    primary_predictor = model.get("primary_predictor", "").strip()
-    covariates = _items(model.get("covariates", ""))
+    primary, covariates, plural = model_predictors(model)
     missing_policy = model.get("missing", "error").strip().lower()
     if missing_policy not in {"error", "drop"}:
         raise ValueError("[model] missing must be 'error' or 'drop'")
-    if not primary_predictor:
-        raise ValueError("Config [model] must specify primary_predictor")
-    intercept_mode = primary_predictor.lower() == "intercept"
+    intercept_mode = primary == ["intercept"]
     if intercept_mode:
-        primary_predictor = "intercept"
-        if covariates:
-            raise ValueError(
-                "Intercept mode is an unadjusted one-sample/group-mean test and does not accept covariates."
-            )
         if references:
             raise ValueError("Intercept mode does not use categorical references; remove entries from [references].")
         variable_names = []
     else:
-        if primary_predictor in covariates or len(covariates) != len(set(covariates)):
-            raise ValueError("Primary predictor/covariates must be unique and non-overlapping")
-        variable_names = [primary_predictor, *covariates]
+        variable_names = [*primary, *covariates]
     if subject_column in variable_names:
         raise ValueError("The imaging subject ID column cannot also be a model variable")
-    invalid_names = [name for name in variable_names if not IDENTIFIER.fullmatch(name)]
-    if invalid_names:
-        raise ValueError(f"Model variable names must be simple Python identifiers: {invalid_names}")
     if not intercept_mode and not set(references).issubset(variable_names):
         raise ValueError("Every configured reference must correspond to the primary predictor or a covariate")
 
@@ -287,24 +298,15 @@ def run_analysis(config: dict, prepared_data_path: Path) -> dict:
             mask_path=Path(paths["mask"]),
         )
 
-    if intercept_mode:
-        rhs = "1"
-        design = patsy.dmatrix("1", data, return_type="dataframe", NA_action="raise")
-        primary_columns = ["Intercept"]
-        primary_indices = [int(design.columns.get_loc("Intercept"))]
-    else:
-        rhs = " + ".join(terms[variable] for variable in variable_names)
-        design = patsy.dmatrix(rhs, data, return_type="dataframe", NA_action="raise")
-        primary_term = terms[primary_predictor]
-        term_slices = design.design_info.term_name_slices
-        if primary_term not in term_slices:
-            raise ValueError(f"Could not identify primary predictor term {primary_term!r} in Patsy design")
-        primary_slice = term_slices[primary_term]
-        primary_indices = list(range(primary_slice.start, primary_slice.stop))
-        primary_columns = list(design.columns[primary_slice])
-
-    if not primary_indices:
-        raise ValueError(f"Primary predictor {primary_predictor!r} produced no design columns")
+    rhs = "1" if intercept_mode else " + ".join(terms.values())
+    design = patsy.dmatrix(rhs, data, return_type="dataframe", NA_action="raise")
+    primary_indices = {}
+    for predictor in primary:
+        term = "Intercept" if intercept_mode else terms[predictor]
+        term_slice = design.design_info.term_name_slices.get(term)
+        if term_slice is None or term_slice.start == term_slice.stop:
+            raise ValueError(f"Primary predictor {predictor!r} produced no design columns")
+        primary_indices[predictor] = list(range(term_slice.start, term_slice.stop))
     design_values = design.to_numpy(dtype=float)
     if not np.isfinite(design_values).all():
         raise ValueError("Design matrix contains non-finite values")
@@ -318,11 +320,6 @@ def run_analysis(config: dict, prepared_data_path: Path) -> dict:
     if residual_df <= 0:
         raise ValueError(f"Model has no residual degrees of freedom: N={len(data)}, rank={rank}")
 
-    primary_contrast = np.zeros((len(primary_indices), design.shape[1]), dtype=float)
-    primary_contrast[np.arange(len(primary_indices)), primary_indices] = 1.0
-    if len(primary_indices) == 1:
-        primary_contrast = primary_contrast[0]
-
     # All model and branch-specific validation completes before output creation.
     output_dir.mkdir(parents=True, exist_ok=True)
     design_output = design.copy()
@@ -335,9 +332,9 @@ def run_analysis(config: dict, prepared_data_path: Path) -> dict:
             design_values=design_values,
             roi_features=roi_features,
             primary_indices=primary_indices,
-            primary_columns=primary_columns,
-            primary_predictor=primary_predictor,
-            primary_reference=references.get(primary_predictor, ""),
+            design_columns=list(design.columns),
+            references=references,
+            predictor_subdirs=plural,
             p_threshold=roi_settings["p_threshold"],
             correction=roi_settings["correction"],
             q_threshold=roi_settings["q_threshold"],
@@ -350,9 +347,8 @@ def run_analysis(config: dict, prepared_data_path: Path) -> dict:
             data=data,
             image_paths=image_paths,
             design=design,
-            primary_contrast=primary_contrast,
-            primary_predictor=primary_predictor,
-            primary_columns=primary_columns,
+            primary_indices=primary_indices,
+            predictor_subdirs=plural,
             residual_df=residual_df,
             mask_image=mask_image,
             p_threshold=voxel_settings["p_threshold"],
@@ -365,15 +361,11 @@ def run_analysis(config: dict, prepared_data_path: Path) -> dict:
     references_text = ", ".join(f"{name}={value}" for name, value in references.items()) or "none"
     summary = [
         f"N: {len(data)}",
-        f"Primary predictor: {primary_predictor}",
+        f"Primary predictors: {', '.join(primary)}" if plural else f"Primary predictor: {primary[0]}",
         f"Model: outcome ~ {rhs}" if intercept_mode else f"Model RHS: {rhs}",
         f"Analyses: {', '.join(modules)}",
         "ROI outcome: ROI_<label> mean" if "roi" in modules else "",
         "Voxelwise outcome: subject image voxel value" if "voxelwise" in modules else "",
-        f"Primary test: {'coefficient' if len(primary_indices) == 1 else 'omnibus_F'}",
-        f"Primary design-column count: {len(primary_indices)}",
-        f"Primary design columns: {', '.join(primary_columns)}",
-        f"Primary predictor reference: {references.get(primary_predictor, 'none')}",
         f"Reference groups: {references_text}",
         f"Design columns: {', '.join(design.columns)}",
         f"Design rank: {rank}/{design.shape[1]}",
@@ -381,15 +373,34 @@ def run_analysis(config: dict, prepared_data_path: Path) -> dict:
         f"Residual degrees of freedom: {residual_df}",
     ]
     summary = [line for line in summary if line]
-    if roi_summary is not None:
-        summary.extend(roi_stats.summary_lines(roi_summary))
-    if voxel_summary is not None:
-        summary.extend(voxelwise_stats.summary_lines(voxel_summary))
+    summary.append("BH-FDR families (when enabled): one per test across ROIs or valid voxels; no pooling across tests or branches.")
+    for predictor, indices in primary_indices.items():
+        columns = list(design.columns[indices])
+        summary.extend([
+            "",
+            f"Predictor: {predictor}",
+            f"Primary test: {'coefficient' if len(indices) == 1 else 'omnibus_F'}",
+            f"Primary design-column count: {len(indices)}",
+            f"Primary design columns: {', '.join(columns)}",
+            f"Primary predictor reference: {references.get(predictor, 'none')}",
+        ])
+        if roi_summary is not None:
+            summary.extend(roi_stats.summary_lines(roi_summary[predictor]))
+        if voxel_summary is not None:
+            result = voxel_summary[predictor]
+            summary.extend(voxelwise_stats.summary_lines(result))
+            for number, (column, coefficient) in enumerate(result["level_results"].items(), 1):
+                summary.append(f"Coefficient {number:02d}: {column}")
+                summary.extend(voxelwise_stats.summary_lines(coefficient))
     (output_dir / "analysis_summary.txt").write_text("\n".join(summary) + "\n", encoding="utf-8")
 
-    _remove_unrequested_outputs(output_dir, modules)
+    if not plural:
+        _remove_unrequested_outputs(output_dir, modules)
     print(
         f"Completed {', '.join(modules)} analysis for N={len(data)}; "
         f"design rank {rank}/{design.shape[1]}, residual df={residual_df}."
     )
+    if not plural:
+        roi_summary = None if roi_summary is None else roi_summary[primary[0]]
+        voxel_summary = None if voxel_summary is None else voxel_summary[primary[0]]
     return {"roi": roi_summary, "voxelwise": voxel_summary, "design": design}

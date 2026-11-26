@@ -8,17 +8,21 @@ from decimal import Decimal
 import nibabel as nib
 import numpy as np
 import pandas as pd
-from nilearn.glm.second_level import SecondLevelModel
+from nilearn.glm.contrasts import compute_contrast
+from nilearn.glm.first_level import run_glm
+from nilearn.glm.regression import SimpleRegressionResults
+from nilearn.maskers import NiftiMasker
 from scipy.stats import f as f_distribution
 from scipy.stats import t as t_distribution
 from statsmodels.stats.multitest import multipletests
 
 
-GENERATED_OUTPUT = re.compile(
-    r"^[A-Za-z][A-Za-z0-9_]*_(?:effect|t|p|q_fdr|uncorrected_p\d+_mask|"
+OUTPUT_SUFFIX = (
+    r"_(?:effect|se|ci_low|ci_high|t|p|q_fdr|uncorrected_p\d+_mask|"
     r"t_uncorrected_p\d+|fdr_q\d+_mask|t_fdr_q\d+|F|F_uncorrected_p\d+|"
     r"F_fdr_q\d+)\.nii\.gz$"
 )
+GENERATED_OUTPUT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*" + OUTPUT_SUFFIX)
 
 
 def is_framework_output_name(name: str) -> bool:
@@ -124,6 +128,9 @@ def _output_names(
     if coefficient:
         names = {
             "effect": f"{token}_effect.nii.gz",
+            "se": f"{token}_se.nii.gz",
+            "ci_low": f"{token}_ci_low.nii.gz",
+            "ci_high": f"{token}_ci_high.nii.gz",
             "stat": f"{token}_t.nii.gz",
             "p": f"{token}_p.nii.gz",
         }
@@ -149,9 +156,8 @@ def run_voxelwise_analysis(
     data,
     image_paths: list[Path],
     design,
-    primary_contrast: np.ndarray,
-    primary_predictor: str,
-    primary_columns: list[str],
+    primary_indices: dict[str, list[int]],
+    predictor_subdirs: bool,
     residual_df: int,
     mask_image,
     p_threshold: float | None,
@@ -159,38 +165,58 @@ def run_voxelwise_analysis(
     q_threshold: float | None,
     output_dir: Path,
 ) -> dict:
-    """Fit t- or omnibus-F maps using the exact Patsy design from orchestration."""
+    """Fit masked OLS once and evaluate all primary contrasts on that fit."""
     if len(image_paths) != len(data) or design.shape[0] != len(data):
         raise ValueError("Voxelwise image/design row counts do not match the validated cohort")
-    coefficient = len(primary_columns) == 1
-    model = SecondLevelModel(
-        mask_img=mask_image,
-        smoothing_fwhm=None,
-        minimize_memory=True,
-        n_jobs=1,
-    )
-    model.fit([str(path) for path in image_paths], design_matrix=design)
-    if coefficient:
-        contrast_result = model.compute_contrast(
-            primary_contrast,
-            second_level_stat_type="t",
-            output_type="all",
-        )
-        effect_data = contrast_result["effect_size"].get_fdata(dtype=np.float64)
-        statistic_data = contrast_result["stat"].get_fdata(dtype=np.float64)
-    else:
-        statistic_image = model.compute_contrast(
-            primary_contrast,
-            second_level_stat_type="F",
-            output_type="stat",
-        )
-        statistic_data = statistic_image.get_fdata(dtype=np.float64)
-        effect_data = None
-
+    masker = NiftiMasker(mask_img=mask_image).fit()
+    labels, results = run_glm(masker.transform([str(path) for path in image_paths]),
+                              design.to_numpy(dtype=float), noise_model="ols", n_jobs=1)
+    results = {label: SimpleRegressionResults(result) for label, result in results.items()}
     mask = mask_image.get_fdata(dtype=np.float32) > 0
+    identity = np.eye(design.shape[1])
+
+    def evaluate(name, indices, destination):
+        coefficient = len(indices) == 1
+        weights = identity[indices[0]] if coefficient else identity[indices]
+        contrast = compute_contrast(labels, results, weights, "t" if coefficient else "F")
+        return _save_test(
+            contrast, name, len(indices), masker, mask, mask_image, residual_df,
+            p_threshold, correction, q_threshold, destination,
+        )
+
+    summaries = {}
+    for name, indices in primary_indices.items():
+        destination = output_dir / name if predictor_subdirs else output_dir
+        result = evaluate(name, indices, destination)
+        result["level_results"] = {}
+        if len(indices) > 1:
+            index_rows = []
+            for number, index in enumerate(indices, 1):
+                column = design.columns[index]
+                folder = f"coefficient_{number:02d}"
+                result["level_results"][column] = evaluate(name, [index], destination / folder)
+                index_rows.append({"directory": folder, "design_column": column})
+            pd.DataFrame(index_rows).to_csv(destination / "coefficient_index.csv", index=False)
+        summaries[name] = result
+    return summaries
+
+
+def _save_test(
+    contrast, predictor, n_columns, masker, mask, mask_image, residual_df,
+    p_threshold, correction, q_threshold, output_dir,
+):
+    """Write one test family, with bounds and FDR computed inside its valid mask."""
+    coefficient = n_columns == 1
+
+    def unmask(values):
+        return masker.inverse_transform(values).get_fdata(dtype=np.float64)
+
+    statistic_data = unmask(contrast.stat())
+    effect_data = unmask(contrast.effect_size()) if coefficient else None
+    variance = unmask(contrast.effect_variance())
     if statistic_data.shape != mask.shape:
         raise ValueError("Voxelwise statistic map shape differs from the configured mask")
-    valid = mask & np.isfinite(statistic_data)
+    valid = mask & np.isfinite(statistic_data) & np.isfinite(variance) & (variance > 0)
     if effect_data is not None:
         if effect_data.shape != mask.shape:
             raise ValueError("Voxelwise effect map shape differs from the configured mask")
@@ -209,7 +235,7 @@ def run_voxelwise_analysis(
     if coefficient:
         p_values = 2.0 * t_distribution.sf(np.abs(statistic_data[valid]), residual_df)
     else:
-        p_values = f_distribution.sf(np.maximum(statistic_data[valid], 0), len(primary_columns), residual_df)
+        p_values = f_distribution.sf(np.maximum(statistic_data[valid], 0), n_columns, residual_df)
     if not np.isfinite(p_values).all():
         raise ValueError("Voxelwise raw p-values contain non-finite values")
     p_map[valid] = p_values.astype(np.float32)
@@ -221,10 +247,19 @@ def run_voxelwise_analysis(
         q_map = np.ones(mask.shape, dtype=np.float32)
         q_map[valid] = q_values.astype(np.float32)
 
-    names = _output_names(primary_predictor, coefficient, p_threshold, correction, q_threshold)
+    names = _output_names(predictor, coefficient, p_threshold, correction, q_threshold)
     output_dir.mkdir(parents=True, exist_ok=True)
     if effect is not None:
         _save_map(effect, mask_image, output_dir / names["effect"], np.float32)
+        se = np.sqrt(variance[valid])
+        half_width = t_distribution.ppf(0.975, residual_df) * se
+        for key, values in (
+            ("se", se), ("ci_low", effect_data[valid] - half_width),
+            ("ci_high", effect_data[valid] + half_width),
+        ):
+            volume = np.zeros(mask.shape, dtype=np.float32)
+            volume[valid] = values
+            _save_map(volume, mask_image, output_dir / names[key], np.float32)
     _save_map(statistic, mask_image, output_dir / names["stat"], np.float32)
     _save_map(p_map, mask_image, output_dir / names["p"], np.float32)
     if q_map is not None:
@@ -240,15 +275,16 @@ def run_voxelwise_analysis(
 
     if q_map is not None and q_threshold is not None:
         q_mask = np.zeros(mask.shape, dtype=np.uint8)
-        q_mask[valid] = (q_map[valid] < q_threshold).astype(np.uint8)
+        q_mask[valid] = (q_values < q_threshold).astype(np.uint8)
         thresholded = np.zeros(mask.shape, dtype=np.float32)
         thresholded[valid] = statistic[valid] * q_mask[valid]
         _save_map(q_mask, mask_image, output_dir / names["q_mask"], np.uint8)
         _save_map(thresholded, mask_image, output_dir / names["q_stat"], np.float32)
 
     keep = set(names.values())
+    family_outputs = re.compile(re.escape(predictor.lower()) + OUTPUT_SUFFIX)
     for path in output_dir.glob("*.nii.gz"):
-        if is_framework_output_name(path.name) and path.name not in keep:
+        if family_outputs.fullmatch(path.name) and path.name not in keep:
             path.unlink()
 
     return {
